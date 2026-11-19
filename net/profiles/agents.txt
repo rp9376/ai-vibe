@@ -1,0 +1,11 @@
+# Profile "agents" (default): cloud agents + everyday development.
+# Each line names a domain list:
+#   agents   = agents/*/domains.txt of enabled agents
+#   personal = ~/.vibe/allow.txt   (vibe allow <host>)
+#   local    = ~/.vibe/local-endpoints.txt
+#   <name>   = net/lists/<name>.txt
+# Directive: no-cloud-state = do not mount state of AGENT_CLOUD=yes agents.
+agents
+vscode
+registries
+personal

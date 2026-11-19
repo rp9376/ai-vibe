@@ -1,0 +1,3 @@
+# Codex: API, ChatGPT sign-in and backend.
+.openai.com
+.chatgpt.com

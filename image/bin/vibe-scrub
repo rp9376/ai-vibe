@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Post-attach cleanup (SPEC EDT-4): remove the optional host bridges VS Code creates when it attaches.
+# This is cleanup, not prevention: verify with `vibe doctor <dir>` on the host after every (re)attach.
+shopt -s nullglob
+removed=0
+for s in /tmp/vscode-ssh-auth-*.sock /tmp/vscode-remote-containers-ipc-*.sock /tmp/vscode-git-*.sock \
+         "$HOME"/.gnupg/S.gpg-agent*; do
+  [ -S "$s" ] || continue
+  if rm -f -- "$s"; then echo "vibe-scrub: removed $s"; removed=$((removed + 1)); fi
+done
+# Credential helpers the editor may have written into ~/.gitconfig.
+if git config --global --get-all credential.helper >/dev/null 2>&1; then
+  git config --global --unset-all credential.helper && echo "vibe-scrub: removed credential.helper from ~/.gitconfig"
+fi
+echo "vibe-scrub: done ($removed bridge socket(s) removed)"

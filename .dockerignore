@@ -1,0 +1,4 @@
+# Build context for image/Dockerfile is the repo root; only these go in.
+*
+!image/
+!agents/

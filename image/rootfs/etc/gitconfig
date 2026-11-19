@@ -1,0 +1,8 @@
+# System git config for the bubble (SPEC STATE-4/5).
+# Identity comes from ~/.vibe/state/git/identity on the host (mounted read-only).
+[include]
+	path = /home/user/.vibe-git/identity
+[credential]
+	helper =
+[init]
+	defaultBranch = main

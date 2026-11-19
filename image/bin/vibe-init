@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Container start: run each agent's init.sh (as 'user'), then idle.
+# init.sh seeds config into the agent's state dir when absent; it must be idempotent,
+# and a failing hook never stops the container.
+for d in /opt/vibe/agents/*/; do
+  if [ -x "$d/init.sh" ]; then
+    "$d/init.sh" || echo "vibe-init: $(basename "$d")/init.sh failed (ignored)" >&2
+  fi
+done
+exec sleep infinity

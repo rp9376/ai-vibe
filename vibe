@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+# vibe — AI VIBE: run AI coding agents in a hardened, egress-allowlisted container.
+# Spec: SPEC.md · Guide: README.md · Help: `vibe help`
+set -euo pipefail
+
+# ---------------------------------------------------------------- setup ---
+resolve_root() {
+  local p=$0 d
+  while [ -L "$p" ]; do
+    d=$(cd "$(dirname "$p")" && pwd -P)
+    p=$(readlink "$p")
+    case $p in /*) ;; *) p="$d/$p" ;; esac
+  done
+  cd "$(dirname "$p")" && pwd -P
+}
+VIBE_ROOT=$(resolve_root)
+VIBE_DATA=${VIBE_DATA:-$HOME/.vibe}
+# shellcheck source=vibe.conf
+. "$VIBE_ROOT/vibe.conf"
+if [ -f "$VIBE_DATA/config" ]; then . "$VIBE_DATA/config"; fi
+
+C_USER=user
+C_HOME=/home/user
+PROXY_URL=http://vibe-proxy:8888
+
+if [ -t 2 ]; then B=$'\e[1m' R=$'\e[31m' Y=$'\e[33m' G=$'\e[32m' N=$'\e[0m'; else B='' R='' Y='' G='' N=''; fi
+info() { printf '%s\n' "${B}vibe:${N} $*" >&2; }
+warn() { printf '%s\n' "${Y}vibe: warning:${N} $*" >&2; }
+die()  { printf '%s\n' "${R}vibe: error:${N} $*" >&2; exit 1; }
+
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+hex()    { printf %s "$1" | od -An -tx1 | tr -d ' \n'; }
+
+need_docker() { docker info >/dev/null 2>&1 || die "cannot talk to Docker (is it running, and may $(id -un) use it?)"; }
+c_exists() { docker container inspect "$1" >/dev/null 2>&1; }
+n_exists() { docker network inspect "$1" >/dev/null 2>&1; }
+image_ok() { docker image inspect "$1" >/dev/null 2>&1; }
+running()  { [ "$(docker container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+label()    { docker inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null; }
+
+# RUN-1 / RUN-2: flags every vibe container gets.
+ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+if [ "${VIBE_CPUS%%.*}" -gt "$ncpu" ] 2>/dev/null; then VIBE_CPUS=$ncpu; fi
+HARDEN=(--init --cap-drop=ALL --security-opt=no-new-privileges
+        --pids-limit="$VIBE_PIDS" --memory="$VIBE_MEMORY" --cpus="$VIBE_CPUS")
+# NET-4
+PROXY_ENV=(-e "HTTP_PROXY=$PROXY_URL" -e "HTTPS_PROXY=$PROXY_URL" -e "http_proxy=$PROXY_URL" -e "https_proxy=$PROXY_URL"
+           -e "NO_PROXY=localhost,127.0.0.1,::1" -e "no_proxy=localhost,127.0.0.1,::1")
+
+# --------------------------------------------------------------- agents ---
+# An agent is a folder agents/<name>/ with agent.conf (SPEC AGT-1).
+agent_get() { ( set +u; . "$1/agent.conf"; eval "printf '%s' \"\${$2:-}\"" ); }
+agent_dirs() {
+  local d
+  for d in "$VIBE_ROOT"/agents/*/; do
+    d=${d%/}
+    [ -f "$d/agent.conf" ] || continue
+    if [ "$(agent_get "$d" AGENT_ENABLED)" != no ]; then printf '%s\n' "$d"; fi
+  done
+}
+
+# -------------------------------------------------------------- network ---
+clean_lines() { sed -e 's/#.*//' -e 's/[[:space:]]//g' "$@" 2>/dev/null | grep -v '^$' || true; }
+check_profile() {
+  case $1 in offline|open) return 0 ;; esac
+  [ -f "$VIBE_ROOT/net/profiles/$1.txt" ] && return 0
+  die "unknown network profile '$1' — built in: offline open; defined: $(ls "$VIBE_ROOT/net/profiles" | sed -n 's/\.txt$//p' | tr '\n' ' ')"
+}
+profile_items() { case $1 in offline|open) ;; *) clean_lines "$VIBE_ROOT/net/profiles/$1.txt" ;; esac; }
+cloud_state() {   # may cloud agents' state be mounted under this profile? yes|no
+  case $1 in offline) echo no; return ;; open) echo yes; return ;; esac
+  if profile_items "$1" | grep -qx no-cloud-state; then echo no; else echo yes; fi
+}
+profile_domains() {   # raw allowlist entries for a profile
+  local item d
+  for item in $(profile_items "$1"); do
+    case $item in
+      no-cloud-state) ;;
+      agents)   while read -r d; do if [ -f "$d/domains.txt" ]; then clean_lines "$d/domains.txt"; fi; done < <(agent_dirs) ;;
+      personal) clean_lines "$VIBE_DATA/allow.txt" ;;
+      local)    clean_lines "$VIBE_DATA/local-endpoints.txt" ;;
+      *) if [ -f "$VIBE_ROOT/net/lists/$item.txt" ]; then clean_lines "$VIBE_ROOT/net/lists/$item.txt"
+         else warn "profile $1: no list net/lists/$item.txt"; fi ;;
+    esac
+  done
+}
+to_regex() {   # "example.com" → exact host; ".example.com" / "*.example.com" → host + subdomains
+  local d wild
+  while IFS= read -r d; do
+    d=${d%%:*}; d=$(printf %s "$d" | tr 'A-Z' 'a-z'); wild=no
+    case $d in '*.'*) d=${d#??}; wild=yes ;; .*) d=${d#.}; wild=yes ;; esac
+    case $d in ''|*[!a-z0-9.-]*) warn "ignoring invalid allowlist entry '$d'"; continue ;; esac
+    d=$(printf %s "$d" | sed 's/\./\\./g')
+    if [ "$wild" = yes ]; then printf '^(.+\\.)?%s$\n' "$d"; else printf '^%s$\n' "$d"; fi
+  done | sort -u
+}
+first_domain() { profile_domains "$1" | sed -n '1{s/^\*\{0,1\}\.//;p;}'; }   # for doctor's reachability check
+
+start_proxy() {   # $1 = profile. NET-1/NET-2: per-project internal network + allowlist proxy.
+  local prof=$1 allow="$VIBE_DATA/run/$P_ID.allow"
+  image_ok "$VIBE_PROXY_IMAGE" || die "proxy image $VIBE_PROXY_IMAGE not found — run: vibe build"
+  mkdir -p "$VIBE_DATA/run"
+  profile_domains "$prof" | to_regex > "$allow"   # rewrite in place: the bind mount follows the inode
+  n_exists "$NET_NAME" || docker network create --internal --label "vibe.id=$P_ID" "$NET_NAME" >/dev/null
+  if c_exists "$PROXY_NAME"; then docker rm -f "$PROXY_NAME" >/dev/null; fi
+  docker run -d --name "$PROXY_NAME" \
+    --label vibe.role=proxy --label "vibe.id=$P_ID" --label "vibe.net=$prof" --label "vibe.project=$P_DIR" \
+    --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:size=8m \
+    --memory=128m --pids-limit=64 --cpus=1 \
+    --add-host=host.docker.internal:host-gateway \
+    --mount "type=bind,src=$allow,dst=/etc/vibe/allow.regex,readonly" \
+    "$VIBE_PROXY_IMAGE" >/dev/null
+  docker network connect --alias vibe-proxy "$NET_NAME" "$PROXY_NAME"
+}
+reload_proxies() {
+  local p id prof
+  docker ps --filter label=vibe.role=proxy --format '{{.Names}}' | while read -r p; do
+    id=$(label "$p" vibe.id); prof=$(label "$p" vibe.net)
+    profile_domains "$prof" | to_regex > "$VIBE_DATA/run/$id.allow"
+    docker restart -t 1 "$p" >/dev/null && info "reloaded $p [$prof]"
+  done
+}
+
+# -------------------------------------------------------------- targets ---
+# A target is a folder, a number from `vibe ls`, or a project name (folder name or container name).
+list_projects() {   # oldest first, so new containers append: "path<TAB>container<TAB>status<TAB>net"
+  docker ps -a --filter label=vibe.role=dev \
+    --format '{{.Label "vibe.project"}}	{{.Names}}	{{.Status}}	{{.Label "vibe.net"}}' |
+    awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }'
+}
+resolve_target() {
+  local t=${1:-} list hits
+  if [ -z "$t" ] || [ -d "$t" ]; then printf '%s' "${t:-$PWD}"; return 0; fi
+  list=$(list_projects)
+  case $t in
+    *[!0-9]*) ;;
+    *) hits=$(printf '%s\n' "$list" | sed -n "${t}p" 2>/dev/null | cut -f1)
+       [ -n "$hits" ] || die "no project #$t — see: vibe ls"
+       printf '%s' "$hits"; return 0 ;;
+  esac
+  hits=$(printf '%s\n' "$list" | awk -F'\t' -v t="$t" 'NF { n = $1; sub(/.*\//, "", n); if (n == t || $2 == t) print $1 }')
+  case $(printf '%s' "$hits" | grep -c .) in
+    1) printf '%s' "$hits" ;;
+    0) die "'$t' is not a folder, a number or a project name — see: vibe ls" ;;
+    *) die "'$t' matches several projects; use the number or the path:"$'\n'"$(printf '%s' "$hits" | sed 's/^/      /')" ;;
+  esac
+}
+
+# -------------------------------------------------------------- project ---
+project() {   # resolve a target into names (SPEC CLI-3) and refuse unsafe mounts
+  local d
+  d=$(resolve_target "${1:-}")
+  [ -d "$d" ] || die "not a directory: $d"
+  P_DIR=$(cd "$d" && pwd -P)
+  [ "$P_DIR" != / ] || die "refusing to mount /"
+  case $P_DIR in *,*) die "paths containing ',' are not supported: $P_DIR" ;; esac
+  case "$HOME/" in "$P_DIR"/*) die "refusing to mount $P_DIR: it contains your home directory" ;; esac
+  case "$VIBE_DATA/" in "$P_DIR"/*) die "refusing to mount $P_DIR: it contains $VIBE_DATA (agent state)" ;; esac
+  case "$VIBE_ROOT/" in "$P_DIR"/*) die "refusing to mount $P_DIR: it contains the vibe definitions (SPEC RUN-3)" ;; esac
+  case "$P_DIR/" in "$VIBE_ROOT"/*) die "refusing to mount $P_DIR: it is inside the vibe definitions (SPEC RUN-3)" ;; esac
+  P_NAME=$(basename "$P_DIR")
+  P_SAFE=$(printf %s "$P_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[^A-Za-z0-9]*//' | cut -c1-40)
+  P_SAFE=${P_SAFE:-project}
+  P_ID="$P_SAFE-$(printf %s "$P_DIR" | sha256 | cut -c1-8)"
+  C_NAME="vibe-$P_ID" NET_NAME="vibe-$P_ID-net" PROXY_NAME="vibe-$P_ID-proxy" VOL_NAME="vibe-$P_ID-home"
+  WS="/workspaces/$P_NAME"
+}
+parse_dir_net() {
+  ARG_DIR="" ARG_NET=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --net) [ $# -ge 2 ] || die "--net needs a profile"; ARG_NET=$2; shift 2 ;;
+      --net=*) ARG_NET=${1#--net=}; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$ARG_DIR" ] || die "unexpected argument: $1"; ARG_DIR=$1; shift ;;
+    esac
+  done
+}
+
+json_list() { local out="" x; for x in "$@"; do out="$out,\"$x\""; done; printf '[%s]' "${out#,}"; }
+metadata() {   # EDT-2: what VS Code reads when it attaches. $1 = cloud state yes|no
+  local exts="$VIBE_EXTENSIONS" d
+  while read -r d; do
+    if [ "$1" = no ] && [ "$(agent_get "$d" AGENT_CLOUD)" = yes ]; then continue; fi
+    exts="$exts $(agent_get "$d" AGENT_EXTENSIONS)"
+  done < <(agent_dirs)
+  # shellcheck disable=SC2086
+  printf '[{"remoteUser":"%s","customizations":{"vscode":{"extensions":%s}},"remoteEnv":{"SSH_AUTH_SOCK":"","GPG_AGENT_INFO":"","REMOTE_CONTAINERS_IPC":""},"postAttachCommand":"/opt/vibe/bin/vibe-scrub"}]' \
+    "$C_USER" "$(json_list $exts)"
+}
+
+create_container() {
+  local net=$1 cs d m e
+  check_profile "$net"
+  cs=$(cloud_state "$net")
+  [ "$net" != open ] || warn "profile 'open': UNRESTRICTED egress — internet, LAN and host services are reachable"
+  mkdir -p "$VIBE_DATA/state/git" "$VIBE_DATA/run"
+  local args=(run -d --name "$C_NAME" --hostname "$(printf %s "vibe-$P_SAFE" | tr '_.' '--' | cut -c1-63)"
+    --label vibe.role=dev --label "vibe.id=$P_ID" --label "vibe.project=$P_DIR" --label "vibe.net=$net"
+    --label "devcontainer.metadata=$(metadata "$cs")"
+    --mount "type=bind,src=$P_DIR,dst=$WS"
+    --mount "type=volume,src=$VOL_NAME,dst=$C_HOME"
+    --mount "type=bind,src=$VIBE_DATA/state/git,dst=$C_HOME/.vibe-git,readonly"
+    -w "$WS" -e "VIBE_PROJECT=$P_NAME" -e "VIBE_WORKSPACE=$WS" -e "VIBE_NET=$net" -e "VIBE_CLOUD_STATE=$cs")
+
+  # WS-1: the host's git must never run config or hooks written by the agent.
+  if [ -d "$P_DIR/.git" ]; then
+    [ -d "$P_DIR/.git/hooks" ] || mkdir "$P_DIR/.git/hooks"
+    if [ -f "$P_DIR/.git/config" ]; then args+=(--mount "type=bind,src=$P_DIR/.git/config,dst=$WS/.git/config,readonly"); fi
+    args+=(--mount "type=bind,src=$P_DIR/.git/hooks,dst=$WS/.git/hooks,readonly")
+  elif [ -e "$P_DIR/.git" ]; then
+    warn ".git is a file (worktree/submodule): git config and hooks are NOT protected in the container"
+  else
+    warn "no git repository: if the agent runs 'git init', .git/config and hooks are protected from the next 'vibe up' (vibe audit flags them meanwhile)"
+  fi
+
+  # STATE-1: bubble-owned agent state; cloud agents' state stays out of local/offline containers.
+  while read -r d; do
+    if [ "$cs" = no ] && [ "$(agent_get "$d" AGENT_CLOUD)" = yes ]; then continue; fi
+    for m in $(agent_get "$d" AGENT_STATE); do
+      mkdir -p "$VIBE_DATA/state/${m%%:*}"
+      args+=(--mount "type=bind,src=$VIBE_DATA/state/${m%%:*},dst=${m#*:}")
+    done
+    for e in $(agent_get "$d" AGENT_ENV); do args+=(-e "$e"); done
+  done < <(agent_dirs)
+
+  case $net in
+    offline) args+=(--network=none) ;;
+    open)    args+=(--network=bridge) ;;
+    *)       start_proxy "$net"; args+=(--network="$NET_NAME" "${PROXY_ENV[@]}") ;;
+  esac
+  args+=("${HARDEN[@]}" "$VIBE_IMAGE")
+  trust_baseline
+  docker "${args[@]}" >/dev/null
+  info "up: $C_NAME [$net] → $WS"
+}
+
+up_container() {   # $1 = requested profile, may be empty (= keep current / default)
+  local want=$1 cur
+  image_ok "$VIBE_IMAGE" || die "image $VIBE_IMAGE not found — run: vibe build"
+  [ -z "$want" ] || check_profile "$want"
+  if c_exists "$C_NAME"; then
+    cur=$(label "$C_NAME" vibe.net)
+    if [ -n "$want" ] && [ "$want" != "$cur" ]; then
+      info "switching $P_NAME [$cur → $want]: recreating (state and home volume are kept)"
+      remove_container
+    else
+      if [ "$(docker container inspect -f '{{.Image}}' "$C_NAME")" != "$(docker image inspect -f '{{.Id}}' "$VIBE_IMAGE")" ]; then
+        warn "$VIBE_IMAGE was rebuilt since $C_NAME was created — 'vibe down && vibe up' to switch (state and home are kept)"
+      fi
+      case $cur in offline|open) ;; *) running "$PROXY_NAME" || start_proxy "$cur" ;; esac
+      if ! running "$C_NAME"; then docker start "$C_NAME" >/dev/null; info "started $C_NAME [$cur]"; fi
+      return 0
+    fi
+  fi
+  create_container "${want:-$VIBE_NET}"
+}
+
+remove_container() {
+  if c_exists "$C_NAME"; then docker rm -f "$C_NAME" >/dev/null; fi
+  if c_exists "$PROXY_NAME"; then docker rm -f "$PROXY_NAME" >/dev/null; fi
+  if n_exists "$NET_NAME"; then docker network rm "$NET_NAME" >/dev/null; fi
+}
+
+# ---------------------------------------------------------------- audit ---
+trust_scan() {   # "sha256<TAB>path" for every host-trust file in the project (WS-2)
+  local p f
+  # shellcheck disable=SC2086
+  (cd "$P_DIR" && for p in $VIBE_TRUST_PATHS; do if [ -e "$p" ]; then find "$p" -type f -print; fi; done) | sort |
+    while IFS= read -r f; do printf '%s\t%s\n' "$(sha256 < "$P_DIR/$f")" "$f"; done
+}
+trust_baseline() { local b="$VIBE_DATA/run/$P_ID.trust"; [ -f "$b" ] || trust_scan > "$b"; }
+audit_report() {
+  local b="$VIBE_DATA/run/$P_ID.trust" changes
+  [ -f "$b" ] || { info "audit: no baseline for $P_DIR yet (taken at first 'vibe up')"; return 0; }
+  changes=$(trust_scan | awk -F'\t' '
+    FILENAME == ARGV[1] { old[$2] = $1; next }
+    { new[$2] = $1 }
+    END {
+      for (p in new) { if (!(p in old)) print "added    " p; else if (old[p] != new[p]) print "changed  " p }
+      for (p in old) if (!(p in new)) print "removed  " p
+    }' "$b" - | sort -k2)
+  if [ -z "$changes" ]; then info "audit: host-trust files unchanged in $P_NAME"; return 0; fi
+  warn "audit: files the HOST may execute changed in $P_DIR:"
+  printf '%s\n' "$changes" | sed 's/^/      /' >&2
+  warn "review them before opening this folder on the host (editor, direnv, git). Then: vibe audit --accept \"$P_DIR\""
+  return 1
+}
+
+# ------------------------------------------------------------- commands ---
+cmd_setup() {
+  local d m f idf name email
+  mkdir -p "$VIBE_DATA/state/git" "$VIBE_DATA/run"; chmod 700 "$VIBE_DATA"
+  while read -r d; do
+    for m in $(agent_get "$d" AGENT_STATE); do mkdir -p "$VIBE_DATA/state/${m%%:*}"; done
+  done < <(agent_dirs)
+  f="$VIBE_DATA/allow.txt"
+  [ -f "$f" ] || printf '%s\n' "# Personal allowlist for the 'agents' profile (vibe allow <domain> appends here)." \
+    "# One host per line; '.example.com' also allows subdomains. Run 'vibe allow' to reload proxies." > "$f"
+  f="$VIBE_DATA/local-endpoints.txt"
+  [ -f "$f" ] || printf '%s\n' "# Hosts reachable under '--net local' (local model servers). One per line." \
+    "# host.docker.internal = this machine; the server must listen on the docker bridge, not only 127.0.0.1." \
+    "#host.docker.internal" > "$f"
+  f="$VIBE_DATA/config"
+  [ -f "$f" ] || printf '%s\n' "# Personal overrides of vibe.conf (same syntax). Examples:" \
+    "#VIBE_BASE_IMAGE=registry.example.com/toolchain:22.04" "#VIBE_MEMORY=16g" > "$f"
+  idf="$VIBE_DATA/state/git/identity"
+  if [ ! -f "$idf" ]; then
+    name=$(git config --global user.name 2>/dev/null || true); email=$(git config --global user.email 2>/dev/null || true)
+    if [ -n "$name" ] && [ -n "$email" ]; then
+      (umask 077; printf '[user]\n\tname = %s\n\temail = %s\n' "$name" "$email" > "$idf")
+      info "git identity for commits in the bubble: $name <$email> ($idf)"
+    else
+      (umask 077; printf '# Git identity for commits made inside vibe containers.\n#[user]\n#\tname = Your Name\n#\temail = you@example.com\n' > "$idf")
+      warn "no host git identity found — edit $idf"
+    fi
+  fi
+  info "private state: $VIBE_DATA"
+  if command -v code >/dev/null 2>&1; then
+    code --list-extensions 2>/dev/null | grep -qi '^ms-vscode-remote.remote-containers$' ||
+      warn "for 'vibe code', install the Dev Containers extension: code --install-extension ms-vscode-remote.remote-containers"
+    cat >&2 <<'EOF'
+vibe: add these to your VS Code *User* settings.json (SPEC EDT-3):
+    "dev.containers.copyGitConfig": false,
+    "dev.containers.gitCredentialHelperConfigLocation": "none",
+    "dev.containers.dockerCredentialHelper": false,
+    "git.terminalAuthentication": false,
+    "github.gitAuthentication": false,
+    "remote.extensionKind": { "anthropic.claude-code": ["workspace"], "openai.chatgpt": ["workspace"] }
+EOF
+  fi
+  command -v vibe >/dev/null 2>&1 || info "put vibe on your PATH:  ./vibe install"
+  info "next: vibe build && vibe doctor"
+}
+
+cmd_install() {   # symlink this checkout's vibe into a bin dir on PATH (default ~/.local/bin)
+  local bin=${1:-$HOME/.local/bin} link
+  link="$bin/vibe"
+  mkdir -p "$bin"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$VIBE_ROOT/vibe" ]; then
+    info "already installed: $link → $VIBE_ROOT/vibe"
+  elif [ -e "$link" ] || [ -L "$link" ]; then
+    die "$link already exists and points elsewhere — remove it first, or: ./vibe install <other-dir>"
+  else
+    ln -s "$VIBE_ROOT/vibe" "$link"
+    info "installed: $link → $VIBE_ROOT/vibe"
+  fi
+  case ":$PATH:" in
+    *":$bin:"*) info "ready — try: vibe help" ;;
+    *) warn "$bin is not on your PATH. Add this to ~/.bashrc (or ~/.zshrc), then open a new terminal:"
+       printf '    export PATH="%s:$PATH"\n' "$bin" >&2 ;;
+  esac
+}
+
+cmd_uninstall() {
+  local link="${1:-$HOME/.local/bin}/vibe"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$VIBE_ROOT/vibe" ]; then rm "$link"; info "removed $link"
+  else info "nothing to remove at $link (not a link to this checkout)"; fi
+}
+
+cmd_build() {
+  local fresh=() uid gid
+  case ${1:-} in --fresh) fresh=(--pull --no-cache) ;; '') ;; *) die "usage: vibe build [--fresh]" ;; esac
+  uid=$(id -u); gid=$(id -g)
+  [ "$uid" -ne 0 ] || die "run vibe as your normal user, not root"
+  info "building $VIBE_IMAGE (base $VIBE_BASE_IMAGE, uid $uid:$gid)"
+  docker build ${fresh[@]+"${fresh[@]}"} -f "$VIBE_ROOT/image/Dockerfile" \
+    --build-arg "BASE_IMAGE=$VIBE_BASE_IMAGE" --build-arg "NODE_MAJOR=$VIBE_NODE_MAJOR" \
+    --build-arg "USER_UID=$uid" --build-arg "USER_GID=$gid" \
+    -t "$VIBE_IMAGE" "$VIBE_ROOT"
+  info "building $VIBE_PROXY_IMAGE"
+  docker build ${fresh[@]+"${fresh[@]}"} -t "$VIBE_PROXY_IMAGE" "$VIBE_ROOT/net/proxy"
+  info "built. Verify with: vibe doctor"
+}
+
+cmd_up()   { parse_dir_net "$@"; project "$ARG_DIR"; up_container "$ARG_NET"; }
+
+cmd_shell() {
+  local dir="" tty=(-i)
+  if [ $# -gt 0 ] && [ "$1" != -- ]; then dir=$1; shift; fi
+  if [ "${1:-}" = -- ]; then shift; fi
+  project "$dir"; up_container ""
+  if [ -t 0 ] && [ -t 1 ]; then tty=(-it); fi
+  if [ $# -gt 0 ]; then exec docker exec "${tty[@]}" -w "$WS" "$C_NAME" "$@"; fi
+  exec docker exec "${tty[@]}" -w "$WS" "$C_NAME" bash -l
+}
+
+cmd_code() {
+  parse_dir_net "$@"; project "$ARG_DIR"; up_container "$ARG_NET"
+  command -v code >/dev/null 2>&1 || die "'code' (VS Code CLI) not found on PATH"
+  code --folder-uri "vscode-remote://attached-container+$(hex "$C_NAME")$(printf %s "$WS" | sed 's/ /%20/g')"
+  info "VS Code is attaching to $C_NAME. Once connected, verify: vibe doctor \"$P_DIR\""
+}
+
+cmd_down() {
+  local purge=no all=no dir="" a p
+  for a; do case $a in --purge) purge=yes ;; --all) all=yes ;; -*) die "unknown option: $a" ;; *) dir=$a ;; esac; done
+  if [ $all = no ]; then down_one "$dir" $purge; return; fi
+  [ -z "$dir" ] || die "use either --all or a project, not both"
+  while IFS= read -r p; do
+    ( down_one "$p" $purge ) </dev/null || warn "could not take down $p (continuing)"
+  done < <(list_projects | cut -f1)
+}
+down_one() {   # $1 = target, $2 = purge yes|no
+  local purge=$2
+  project "$1"
+  remove_container
+  info "down: $C_NAME"
+  audit_report || true
+  if [ $purge = yes ]; then
+    if docker volume rm "$VOL_NAME" >/dev/null 2>&1; then info "removed home volume $VOL_NAME"; fi
+    rm -f "$VIBE_DATA/run/$P_ID.trust" "$VIBE_DATA/run/$P_ID.allow"
+  fi
+}
+
+cmd_ls() {
+  local list tab=$'\t'
+  list=$(list_projects)
+  if [ -z "$list" ]; then info "no project containers — start one with: vibe up [dir]"; return 0; fi
+  { printf '#\tPROJECT\tSTATUS\tNET\tPATH\n'
+    printf '%s\n' "$list" | awk -F'\t' '{ n = $1; sub(/.*\//, "", n); printf "%d\t%s\t%s\t%s\t%s\n", NR, n, $3, $4, $1 }'
+  } | if command -v column >/dev/null 2>&1; then column -t -s "$tab"; else cat; fi
+  info "use the # or PROJECT name with any command, e.g.: vibe shell 1 · vibe down shop · vibe down --all"
+}
+
+cmd_allow() {
+  local dom f="$VIBE_DATA/allow.txt"
+  mkdir -p "$VIBE_DATA"; touch "$f"
+  for dom; do
+    [ -n "$(printf '%s\n' "$dom" | to_regex 2>/dev/null)" ] || die "not a valid host: $dom"
+    if clean_lines "$f" | grep -qxF "$dom"; then info "already allowed: $dom"
+    else printf '%s\n' "$dom" >> "$f"; info "allowed: $dom"; fi
+  done
+  if [ $# -eq 0 ]; then info "personal allowlist ($f):"; clean_lines "$f" | sed 's/^/      /' >&2; fi
+  reload_proxies
+}
+
+cmd_logs() {
+  local dir="" follow=() a
+  for a; do case $a in -f|--follow) follow=(-f) ;; -*) die "unknown option: $a" ;; *) dir=$a ;; esac; done
+  project "$dir"
+  c_exists "$PROXY_NAME" || die "no proxy for $P_DIR (not up, or profile offline/open)"
+  docker logs --tail 200 ${follow[@]+"${follow[@]}"} "$PROXY_NAME" 2>&1
+}
+
+cmd_audit() {
+  local dir="" accept=no a
+  for a; do case $a in --accept) accept=yes ;; -*) die "unknown option: $a" ;; *) dir=$a ;; esac; done
+  project "$dir"
+  if [ $accept = yes ]; then mkdir -p "$VIBE_DATA/run"; trust_scan > "$VIBE_DATA/run/$P_ID.trust"; info "audit: baseline updated for $P_DIR"; return 0; fi
+  audit_report
+}
+
+cmd_doctor() {
+  local script="$VIBE_ROOT/tests/doctor.sh" color=0 rc=0
+  if [ -t 1 ]; then color=1; fi
+  if [ $# -gt 0 ]; then   # VER-3: live container
+    project "$1"
+    running "$C_NAME" || die "$C_NAME is not running — vibe up \"$P_DIR\""
+    info "live checks in $C_NAME"
+    docker exec -i -w "$WS" -e "VIBE_COLOR=$color" -e "VIBE_DOCTOR_ALLOWED=$(first_domain "$(label "$C_NAME" vibe.net)")" \
+      "$C_NAME" bash -s -- live < "$script"
+    return
+  fi
+  # VER-1: image, no host mounts, script via stdin, local image only.
+  image_ok "$VIBE_IMAGE" || die "image $VIBE_IMAGE not found — run: vibe build"
+  local common=(run --rm -i --pull=never --tmpfs /workspaces/doctor:mode=1777 -w /workspaces/doctor
+                -e VIBE_WORKSPACE=/workspaces/doctor -e "VIBE_COLOR=$color" "${HARDEN[@]}")
+  info "phase 1/2 — image, offline (no mounts, --network none)"
+  docker "${common[@]}" --network=none -e VIBE_NET=offline "$VIBE_IMAGE" bash -s -- image < "$script" || rc=1
+
+  info "phase 2/2 — egress allowlist (throwaway internal network + proxy, profile 'agents')"
+  P_ID="doctor-$$" P_DIR="(vibe doctor)"
+  NET_NAME="vibe-$P_ID-net" PROXY_NAME="vibe-$P_ID-proxy"
+  trap 'remove_container 2>/dev/null; rm -f "$VIBE_DATA/run/$P_ID.allow"' EXIT
+  C_NAME="vibe-$P_ID"
+  start_proxy agents
+  docker "${common[@]}" --network="$NET_NAME" "${PROXY_ENV[@]}" -e VIBE_NET=agents \
+    -e "VIBE_DOCTOR_ALLOWED=$(first_domain agents)" "$VIBE_IMAGE" bash -s -- net < "$script" || rc=1
+
+  if [ $rc -eq 0 ]; then info "${G}doctor: all checks passed${N}"; else die "doctor: failures above"; fi
+}
+
+usage() {
+  cat <<EOF
+vibe — run AI coding agents in a hardened, egress-allowlisted container
+
+  vibe install [bin-dir]         put vibe on PATH (symlink into ~/.local/bin); uninstall to undo
+  vibe setup                     one-time: create ~/.vibe, git identity, print editor settings
+  vibe build [--fresh]           build the vibe image and the proxy image
+  vibe doctor [project]          verify the image (no project) or a running project container
+  vibe up [dir] [--net P]        start the project container (dir defaults to .)
+  vibe shell [project] [-- cmd]  interactive shell, or run a command, in the container
+  vibe code [project] [--net P]  up + attach VS Code
+  vibe down [project] [--purge]  remove container + proxy (--purge: also the home volume)
+  vibe down --all [--purge]      take down every project container
+  vibe ls                        list project containers, numbered
+  vibe allow [host...]           allow hosts (personal list); always reloads running proxies
+  vibe logs [dir] [-f]           proxy log — what was allowed and blocked
+  vibe audit [dir] [--accept]    changes to files the host may execute
+
+project = a folder, a # from "vibe ls", or a project name (folder name). Defaults to the current folder.
+network profiles (--net): agents (default) · local · offline · open · or net/profiles/<name>.txt
+definitions: $VIBE_ROOT
+private state: $VIBE_DATA
+EOF
+}
+
+cmd=${1:-help}
+[ $# -eq 0 ] || shift
+case $cmd in
+  install)   cmd_install "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  setup)  cmd_setup "$@" ;;
+  build)  need_docker; cmd_build "$@" ;;
+  up)     need_docker; cmd_up "$@" ;;
+  shell)  need_docker; cmd_shell "$@" ;;
+  code)   need_docker; cmd_code "$@" ;;
+  down)   need_docker; cmd_down "$@" ;;
+  ls)     need_docker; cmd_ls ;;
+  allow)  need_docker; cmd_allow "$@" ;;
+  logs)   need_docker; cmd_logs "$@" ;;
+  audit)  cmd_audit "$@" ;;
+  doctor) need_docker; cmd_doctor "$@" ;;
+  help|-h|--help) usage ;;
+  *) die "unknown command '$cmd' — try: vibe help" ;;
+esac

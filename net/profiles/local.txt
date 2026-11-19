@@ -1,0 +1,4 @@
+# Profile "local": sensitive data. Only your local model endpoints are reachable,
+# and cloud agents' state (credentials) is not mounted. See SPEC AGT-4.
+local
+no-cloud-state

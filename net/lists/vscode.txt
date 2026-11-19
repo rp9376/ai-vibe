@@ -1,0 +1,9 @@
+# VS Code server and extension marketplace (needed when VS Code attaches).
+update.code.visualstudio.com
+.vscode-cdn.net
+vscode.download.prss.microsoft.com
+marketplace.visualstudio.com
+.gallerycdn.vsassets.io
+.gallery.vsassets.io
+.vscode-unpkg.net
+vscode.blob.core.windows.net

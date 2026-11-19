@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.codex/auth.json)"
+    ]
+  },
+  "env": {
+    "DISABLE_AUTOUPDATER": "1"
+  }
+}

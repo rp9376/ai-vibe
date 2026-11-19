@@ -1,0 +1,8 @@
+# Seeded by vibe on first start (from agents/codex/config.toml). This copy is yours:
+# it lives in ~/.vibe/state/codex/config.toml on the host and is never overwritten.
+#
+# Codex's own Linux sandbox (bubblewrap) cannot start inside a vibe container on hosts that
+# restrict unprivileged user namespaces (SPEC §14 E-1), and every command would fail.
+# The container + egress allowlist are the boundary, so Codex runs commands directly.
+# Approval prompts still apply unless you start it with `codex-vibe`.
+sandbox_mode = "danger-full-access"

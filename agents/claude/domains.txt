@@ -1,0 +1,4 @@
+# Claude Code: API, sign-in and account. '.x.com' = x.com and its subdomains.
+.anthropic.com
+.claude.ai
+.claude.com

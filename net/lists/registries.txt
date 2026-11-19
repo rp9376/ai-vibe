@@ -1,0 +1,12 @@
+# Package registries and source hosts. Each one is also a possible exfiltration channel (SPEC NET-7).
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+github.com
+codeload.github.com
+.githubusercontent.com
+crates.io
+static.crates.io
+index.crates.io
+proxy.golang.org
+sum.golang.org
