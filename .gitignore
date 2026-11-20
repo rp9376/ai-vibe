@@ -8,3 +8,6 @@
 .idea/
 .vscode/
 .DS_Store
+
+# External review notes with private details (LAN addresses); triage lives in REVIEW_TRIAGE.md
+QWEN's_REVIEW.md

@@ -1,0 +1,15 @@
+# Cheap checks on every push and PR: script syntax and shellcheck. No Docker, no images.
+# The boundary itself is verified by `vibe doctor` on a real host (SPEC VER-1..5).
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax
+        run: for f in vibe tests/doctor.sh image/bin/* agents/*/*.sh; do bash -n "$f" || exit 1; done
+      - name: shellcheck
+        run: shellcheck -S warning -x vibe tests/doctor.sh image/bin/* agents/*/*.sh

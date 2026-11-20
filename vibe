@@ -22,6 +22,9 @@ if [ -f "$VIBE_DATA/config" ]; then . "$VIBE_DATA/config"; fi
 C_USER=user
 C_HOME=/home/user
 PROXY_URL=http://vibe-proxy:8888
+# Bump when this script and the images must change together (e.g. the allowlist format); both Dockerfiles
+# carry the same number as the label vibe.format, and vibe refuses/warns on a mismatch.
+VIBE_FORMAT=2
 
 if [ -t 2 ]; then B=$'\e[1m' R=$'\e[31m' Y=$'\e[33m' G=$'\e[32m' N=$'\e[0m'; else B='' R='' Y='' G='' N=''; fi
 info() { printf '%s\n' "${B}vibe:${N} $*" >&2; }
@@ -35,21 +38,29 @@ need_docker() { docker info >/dev/null 2>&1 || die "cannot talk to Docker (is it
 c_exists() { docker container inspect "$1" >/dev/null 2>&1; }
 n_exists() { docker network inspect "$1" >/dev/null 2>&1; }
 image_ok() { docker image inspect "$1" >/dev/null 2>&1; }
+image_current() { [ "$(docker image inspect -f '{{index .Config.Labels "vibe.format"}}' "$1" 2>/dev/null)" = "$VIBE_FORMAT" ]; }
+same_image() { [ "$(docker container inspect -f '{{.Image}}' "$1" 2>/dev/null)" = "$(docker image inspect -f '{{.Id}}' "$2" 2>/dev/null)" ]; }
 running()  { [ "$(docker container inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 label()    { docker inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null; }
 
-# RUN-1 / RUN-2: flags every vibe container gets.
-ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
-if [ "${VIBE_CPUS%%.*}" -gt "$ncpu" ] 2>/dev/null; then VIBE_CPUS=$ncpu; fi
-HARDEN=(--init --cap-drop=ALL --security-opt=no-new-privileges
-        --pids-limit="$VIBE_PIDS" --memory="$VIBE_MEMORY" --cpus="$VIBE_CPUS")
+# RUN-1 / RUN-2: flags every vibe container gets. Built lazily (needs docker for the CPU clamp).
+harden() {
+  local ncpu
+  case $VIBE_CPUS in ''|*[!0-9.]*) die "VIBE_CPUS must be a number (got '$VIBE_CPUS')" ;; esac
+  case $VIBE_PIDS in ''|*[!0-9]*) die "VIBE_PIDS must be a whole number (got '$VIBE_PIDS')" ;; esac
+  # Clamp to the CPUs Docker actually has (on macOS that's the VM, not the Mac).
+  ncpu=$(docker info --format '{{.NCPU}}' 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+  if [ "${VIBE_CPUS%%.*}" -gt "$ncpu" ] 2>/dev/null; then VIBE_CPUS=$ncpu; fi
+  HARDEN=(--init --cap-drop=ALL --security-opt=no-new-privileges
+          --pids-limit="$VIBE_PIDS" --memory="$VIBE_MEMORY" --cpus="$VIBE_CPUS")
+}
 # NET-4
 PROXY_ENV=(-e "HTTP_PROXY=$PROXY_URL" -e "HTTPS_PROXY=$PROXY_URL" -e "http_proxy=$PROXY_URL" -e "https_proxy=$PROXY_URL"
            -e "NO_PROXY=localhost,127.0.0.1,::1" -e "no_proxy=localhost,127.0.0.1,::1")
 
 # --------------------------------------------------------------- agents ---
 # An agent is a folder agents/<name>/ with agent.conf (SPEC AGT-1).
-agent_get() { ( set +u; . "$1/agent.conf"; eval "printf '%s' \"\${$2:-}\"" ); }
+agent_get() { ( set +u; . "$1/agent.conf"; printf '%s' "${!2:-}" ); }
 agent_dirs() {
   local d
   for d in "$VIBE_ROOT"/agents/*/; do
@@ -84,24 +95,49 @@ profile_domains() {   # raw allowlist entries for a profile
     esac
   done
 }
-to_regex() {   # "example.com" → exact host; ".example.com" / "*.example.com" → host + subdomains
-  local d wild
-  while IFS= read -r d; do
-    d=${d%%:*}; d=$(printf %s "$d" | tr 'A-Z' 'a-z'); wild=no
+# Allowlist entries → tinyproxy URL regexes (FilterURLs On: CONNECT is matched as "host:port",
+# plain HTTP as "http://host:port/..."). NET-2:
+#   example.com        HTTPS to example.com:443 only
+#   .example.com       same, plus subdomains (also *.example.com)
+#   host:11434         HTTPS (CONNECT) or plain HTTP to exactly that port
+to_regex() {
+  local e d port wild h
+  while IFS= read -r e; do
+    d=$(printf %s "${e%%:*}" | tr 'A-Z' 'a-z'); port=443; wild=no
+    case $e in *:*) port=${e#*:} ;; esac
     case $d in '*.'*) d=${d#??}; wild=yes ;; .*) d=${d#.}; wild=yes ;; esac
-    case $d in ''|*[!a-z0-9.-]*) warn "ignoring invalid allowlist entry '$d'"; continue ;; esac
-    d=$(printf %s "$d" | sed 's/\./\\./g')
-    if [ "$wild" = yes ]; then printf '^(.+\\.)?%s$\n' "$d"; else printf '^%s$\n' "$d"; fi
+    case $d in ''|*[!a-z0-9.-]*) warn "ignoring invalid allowlist entry '$e'"; continue ;; esac
+    case $port in ''|*[!0-9]*) warn "ignoring invalid allowlist entry '$e' (bad port)"; continue ;; esac
+    h=$(printf %s "$d" | sed 's/\./\\./g')
+    [ "$wild" = no ] || h="(.+\\.)?$h"
+    printf '^%s:%s$\n' "$h" "$port"                                   # HTTPS via CONNECT
+    case $port in
+      443) ;;
+      80) printf '^http://%s(:80)?(/|$)\n' "$h" ;;                     # plain HTTP, default port
+      *)  printf '^http://%s:%s(/|$)\n' "$h" "$port" ;;
+    esac
   done | sort -u
 }
 first_domain() { profile_domains "$1" | sed -n '1{s/^\*\{0,1\}\.//;p;}'; }   # for doctor's reachability check
 
+create_network() {   # NET-1: internal (no route out) AND isolated (the host gets no address on it)
+  n_exists "$NET_NAME" && return 0
+  docker network create --internal -o com.docker.network.bridge.gateway_mode_ipv4=isolated \
+      --label "vibe.id=$P_ID" "$NET_NAME" >/dev/null 2>&1 ||
+    docker network create --internal -o com.docker.network.bridge.inhibit_ipv4=true \
+      --label "vibe.id=$P_ID" "$NET_NAME" >/dev/null ||
+    die "could not create an isolated network (Docker too old?)"
+}
+write_allowlist() {   # $1 = profile, $2 = file. Rewrite IN PLACE: the proxy's bind mount follows the inode.
+  profile_domains "$1" | to_regex > "$2"
+}
 start_proxy() {   # $1 = profile. NET-1/NET-2: per-project internal network + allowlist proxy.
   local prof=$1 allow="$VIBE_DATA/run/$P_ID.allow"
   image_ok "$VIBE_PROXY_IMAGE" || die "proxy image $VIBE_PROXY_IMAGE not found — run: vibe build"
+  image_current "$VIBE_PROXY_IMAGE" || die "proxy image $VIBE_PROXY_IMAGE is older than this vibe (its allowlist format differs) — run: vibe build"
   mkdir -p "$VIBE_DATA/run"
-  profile_domains "$prof" | to_regex > "$allow"   # rewrite in place: the bind mount follows the inode
-  n_exists "$NET_NAME" || docker network create --internal --label "vibe.id=$P_ID" "$NET_NAME" >/dev/null
+  write_allowlist "$prof" "$allow"
+  create_network
   if c_exists "$PROXY_NAME"; then docker rm -f "$PROXY_NAME" >/dev/null; fi
   docker run -d --name "$PROXY_NAME" \
     --label vibe.role=proxy --label "vibe.id=$P_ID" --label "vibe.net=$prof" --label "vibe.project=$P_DIR" \
@@ -112,12 +148,25 @@ start_proxy() {   # $1 = profile. NET-1/NET-2: per-project internal network + al
     "$VIBE_PROXY_IMAGE" >/dev/null
   docker network connect --alias vibe-proxy "$NET_NAME" "$PROXY_NAME"
 }
+refresh_allowlist() {   # $1 = profile: regenerate; restart the proxy only if the list changed
+  local allow="$VIBE_DATA/run/$P_ID.allow" new
+  new=$(profile_domains "$1" | to_regex)
+  if [ "$new" != "$(cat "$allow" 2>/dev/null)" ]; then
+    write_allowlist "$1" "$allow"
+    docker restart -t 1 "$PROXY_NAME" >/dev/null && info "allowlist changed: reloaded $PROXY_NAME"
+  fi
+}
 reload_proxies() {
-  local p id prof
+  local p prof
+  image_current "$VIBE_PROXY_IMAGE" || die "proxy image $VIBE_PROXY_IMAGE is older than this vibe — run: vibe build (your list is saved)"
   docker ps --filter label=vibe.role=proxy --format '{{.Names}}' | while read -r p; do
-    id=$(label "$p" vibe.id); prof=$(label "$p" vibe.net)
-    profile_domains "$prof" | to_regex > "$VIBE_DATA/run/$id.allow"
-    docker restart -t 1 "$p" >/dev/null && info "reloaded $p [$prof]"
+    prof=$(label "$p" vibe.net)
+    ( P_ID=$(label "$p" vibe.id); P_DIR=$(label "$p" vibe.project); PROXY_NAME=$p; NET_NAME="vibe-$P_ID-net"
+      if same_image "$p" "$VIBE_PROXY_IMAGE"; then
+        write_allowlist "$prof" "$VIBE_DATA/run/$P_ID.allow"; docker restart -t 1 "$p" >/dev/null
+      else
+        start_proxy "$prof"   # built from an older image: replace it (its dev container keeps running)
+      fi ) && info "reloaded $p [$prof]"
   done
 }
 
@@ -177,6 +226,11 @@ parse_dir_net() {
   done
 }
 
+git_secrets() {   # print (redacted) lines of a git config that carry credentials; fails if none
+  grep -inE 'https?://[^/@[:space:]]*:[^/@[:space:]]+@|https?://(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-)[^/@[:space:]]*@|extraheader[[:space:]]*=.*(authorization|bearer|basic)|^[[:space:]]*password[[:space:]]*=' "$1" |
+    sed 's/=.*/= ***/'
+}
+
 json_list() { local out="" x; for x in "$@"; do out="$out,\"$x\""; done; printf '[%s]' "${out#,}"; }
 metadata() {   # EDT-2: what VS Code reads when it attaches. $1 = cloud state yes|no
   local exts="$VIBE_EXTENSIONS" d
@@ -194,6 +248,7 @@ create_container() {
   check_profile "$net"
   cs=$(cloud_state "$net")
   [ "$net" != open ] || warn "profile 'open': UNRESTRICTED egress — internet, LAN and host services are reachable"
+  harden   # validates limits before anything is started
   mkdir -p "$VIBE_DATA/state/git" "$VIBE_DATA/run"
   local args=(run -d --name "$C_NAME" --hostname "$(printf %s "vibe-$P_SAFE" | tr '_.' '--' | cut -c1-63)"
     --label vibe.role=dev --label "vibe.id=$P_ID" --label "vibe.project=$P_DIR" --label "vibe.net=$net"
@@ -204,6 +259,11 @@ create_container() {
     -w "$WS" -e "VIBE_PROJECT=$P_NAME" -e "VIBE_WORKSPACE=$WS" -e "VIBE_NET=$net" -e "VIBE_CLOUD_STATE=$cs")
 
   # WS-1: the host's git must never run config or hooks written by the agent.
+  if [ -f "$P_DIR/.git/config" ] && git_secrets "$P_DIR/.git/config" >/dev/null; then
+    warn "$P_DIR/.git/config contains credentials (the agent could read them and push with them):"
+    git_secrets "$P_DIR/.git/config" | sed 's/^/      /' >&2
+    die "remove them first, e.g.  git remote set-url origin https://github.com/OWNER/REPO.git  (keep tokens in a credential helper on the host)"
+  fi
   if [ -d "$P_DIR/.git" ]; then
     [ -d "$P_DIR/.git/hooks" ] || mkdir "$P_DIR/.git/hooks"
     if [ -f "$P_DIR/.git/config" ]; then args+=(--mount "type=bind,src=$P_DIR/.git/config,dst=$WS/.git/config,readonly"); fi
@@ -238,6 +298,7 @@ create_container() {
 up_container() {   # $1 = requested profile, may be empty (= keep current / default)
   local want=$1 cur
   image_ok "$VIBE_IMAGE" || die "image $VIBE_IMAGE not found — run: vibe build"
+  image_current "$VIBE_IMAGE" || warn "$VIBE_IMAGE is older than this vibe — run: vibe build, then vibe down/up your projects"
   [ -z "$want" ] || check_profile "$want"
   if c_exists "$C_NAME"; then
     cur=$(label "$C_NAME" vibe.net)
@@ -248,7 +309,15 @@ up_container() {   # $1 = requested profile, may be empty (= keep current / defa
       if [ "$(docker container inspect -f '{{.Image}}' "$C_NAME")" != "$(docker image inspect -f '{{.Id}}' "$VIBE_IMAGE")" ]; then
         warn "$VIBE_IMAGE was rebuilt since $C_NAME was created — 'vibe down && vibe up' to switch (state and home are kept)"
       fi
-      case $cur in offline|open) ;; *) running "$PROXY_NAME" || start_proxy "$cur" ;; esac
+      case $cur in
+        offline|open) ;;
+        *) # a proxy from an older image is simply replaced; the dev container keeps running
+           if ! running "$PROXY_NAME" || ! same_image "$PROXY_NAME" "$VIBE_PROXY_IMAGE"; then start_proxy "$cur"; info "proxy (re)started for $P_NAME"
+           else refresh_allowlist "$cur"; fi
+           if [ -z "$(docker network inspect -f '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}{{index .Options "com.docker.network.bridge.inhibit_ipv4"}}' "$NET_NAME" 2>/dev/null)" ]; then
+             warn "$NET_NAME predates host isolation (the host is reachable from it) — run: vibe down $P_NAME && vibe up $P_NAME"
+           fi ;;
+      esac
       if ! running "$C_NAME"; then docker start "$C_NAME" >/dev/null; info "started $C_NAME [$cur]"; fi
       return 0
     fi
@@ -451,19 +520,38 @@ cmd_audit() {
   audit_report
 }
 
+start_hostsvc() {   # NET-1 test: a throwaway HTTP service on ALL host interfaces that bubbles must NOT reach
+  HOSTSVC_PORT=$(( 40000 + RANDOM % 20000 )) HOSTSVC_NAME="vibe-doctor-hostsvc-$$"
+  docker run -d --rm --name "$HOSTSVC_NAME" --network host --cap-drop=ALL --security-opt=no-new-privileges \
+    --read-only --tmpfs /srv -w /srv "$VIBE_IMAGE" python3 -m http.server "$HOSTSVC_PORT" --bind 0.0.0.0 >/dev/null 2>&1 || return 1
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do   # it must answer on the host, or the test proves nothing
+    if docker exec "$HOSTSVC_NAME" curl -s -o /dev/null "http://127.0.0.1:$HOSTSVC_PORT/" 2>/dev/null; then return 0; fi
+    sleep 0.3
+  done
+  return 1
+}
+stop_hostsvc() { if [ -n "${HOSTSVC_NAME:-}" ]; then docker rm -f "$HOSTSVC_NAME" >/dev/null 2>&1 || true; fi; }
+
 cmd_doctor() {
-  local script="$VIBE_ROOT/tests/doctor.sh" color=0 rc=0
+  local script="$VIBE_ROOT/tests/doctor.sh" color=0 rc=0 port=""
   if [ -t 1 ]; then color=1; fi
   if [ $# -gt 0 ]; then   # VER-3: live container
     project "$1"
     running "$C_NAME" || die "$C_NAME is not running — vibe up \"$P_DIR\""
+    local net; net=$(label "$C_NAME" vibe.net)
+    case $net in offline|open) ;; *)
+      trap stop_hostsvc EXIT
+      if start_hostsvc; then port=$HOSTSVC_PORT; else warn "could not start the host test service"; fi ;;
+    esac
     info "live checks in $C_NAME"
-    docker exec -i -w "$WS" -e "VIBE_COLOR=$color" -e "VIBE_DOCTOR_ALLOWED=$(first_domain "$(label "$C_NAME" vibe.net)")" \
-      "$C_NAME" bash -s -- live < "$script"
+    docker exec -i -w "$WS" -e "VIBE_COLOR=$color" -e "VIBE_DOCTOR_ALLOWED=$(first_domain "$net")" \
+      -e "VIBE_DOCTOR_HOSTPORT=$port" "$C_NAME" bash -s -- live < "$script"
     return
   fi
   # VER-1: image, no host mounts, script via stdin, local image only.
   image_ok "$VIBE_IMAGE" || die "image $VIBE_IMAGE not found — run: vibe build"
+  harden
   local common=(run --rm -i --pull=never --tmpfs /workspaces/doctor:mode=1777 -w /workspaces/doctor
                 -e VIBE_WORKSPACE=/workspaces/doctor -e "VIBE_COLOR=$color" "${HARDEN[@]}")
   info "phase 1/2 — image, offline (no mounts, --network none)"
@@ -472,10 +560,11 @@ cmd_doctor() {
   info "phase 2/2 — egress allowlist (throwaway internal network + proxy, profile 'agents')"
   P_ID="doctor-$$" P_DIR="(vibe doctor)"
   NET_NAME="vibe-$P_ID-net" PROXY_NAME="vibe-$P_ID-proxy"
-  trap 'remove_container 2>/dev/null; rm -f "$VIBE_DATA/run/$P_ID.allow"' EXIT
+  trap 'stop_hostsvc; remove_container 2>/dev/null; rm -f "$VIBE_DATA/run/$P_ID.allow"' EXIT
   C_NAME="vibe-$P_ID"
   start_proxy agents
-  docker "${common[@]}" --network="$NET_NAME" "${PROXY_ENV[@]}" -e VIBE_NET=agents \
+  if start_hostsvc; then port=$HOSTSVC_PORT; else warn "could not start the host test service"; fi
+  docker "${common[@]}" --network="$NET_NAME" "${PROXY_ENV[@]}" -e VIBE_NET=agents -e "VIBE_DOCTOR_HOSTPORT=$port" \
     -e "VIBE_DOCTOR_ALLOWED=$(first_domain agents)" "$VIBE_IMAGE" bash -s -- net < "$script" || rc=1
 
   if [ $rc -eq 0 ]; then info "${G}doctor: all checks passed${N}"; else die "doctor: failures above"; fi
@@ -497,7 +586,7 @@ vibe — run AI coding agents in a hardened, egress-allowlisted container
   vibe ls                        list project containers, numbered
   vibe allow [host...]           allow hosts (personal list); always reloads running proxies
   vibe logs [dir] [-f]           proxy log — what was allowed and blocked
-  vibe audit [dir] [--accept]    changes to files the host may execute
+  vibe audit [dir] [--accept]    changes to files the host may run (a tripwire, not an integrity check)
 
 project = a folder, a # from "vibe ls", or a project name (folder name). Defaults to the current folder.
 network profiles (--net): agents (default) · local · offline · open · or net/profiles/<name>.txt

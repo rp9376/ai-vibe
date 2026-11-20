@@ -46,7 +46,7 @@ opencode only ever talks to an AI model running **on your own computer**. Nothin
    ```
    host.docker.internal:11434
    ```
-4. Tell opencode which model to use: edit `~/.vibe/state/opencode/config/opencode.json` (created after your first local-mode start) and set the model name you downloaded. The provider must stay named `local`.
+4. Tell opencode which model to use: edit `~/.vibe/state/opencode/config/opencode.jsonc` (created on your first local-mode start) and set the model name you downloaded, in both `models` and `model`. The provider must stay named `local`. If your server isn't Ollama, also change `baseURL` (and `apiKey` if it needs one), and put the same `host:port` in `local-endpoints.txt`.
 
 ### Daily use
 

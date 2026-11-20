@@ -6,3 +6,5 @@ COPY tinyproxy.conf /etc/vibe/tinyproxy.conf
 USER 65534:65534
 EXPOSE 8888
 CMD ["tinyproxy", "-d", "-c", "/etc/vibe/tinyproxy.conf"]
+# Allowlist format this proxy understands (see VIBE_FORMAT in vibe).
+LABEL vibe.format="2"

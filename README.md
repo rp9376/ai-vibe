@@ -7,6 +7,12 @@
 - **Locked down:** non-root, zero capabilities, no-new-privileges, resource limits, and an egress allowlist proxy.
 - **Provable:** `vibe doctor` checks every one of those claims.
 
+> **What it is, and isn't.** The bubble keeps agents (including ones tricked by something they read) away from the rest of your machine, your credentials and your network, so they can run fast without approval prompts. It is a container, not a virtual machine. Two things it can't change:
+> - a cloud agent (Claude, Codex) sends the code it works on to its vendor; that's how it works;
+> - allowlisted sites (GitHub, npm, …) can carry data out.
+>
+> So: sensitive code → `--net local` with opencode and a model on your own machine. Never keep secrets in a project that you couldn't revoke. Details: [docs/SECURITY.md](docs/SECURITY.md).
+
 > **New to AI agents in the terminal? Start with the [manual](docs/manual/README.md).** It's four short pages, from install to your first task.
 
 Requirements live in [SPEC.md](SPEC.md). The security model and its limits are in [docs/SECURITY.md](docs/SECURITY.md).
@@ -87,43 +93,42 @@ Codex's own sandbox (bubblewrap) can't start inside the container on hosts that 
 | `--net` | Reachable | Cloud agent credentials |
 |---|---|---|
 | `agents` *(default)* | agent APIs, VS Code marketplace, package registries, your `~/.vibe/allow.txt` | mounted |
-| `local` | only hosts in `~/.vibe/local-endpoints.txt` | **not** mounted |
+| `local` | only the `host:port` entries in `~/.vibe/local-endpoints.txt` | **not** mounted |
 | `offline` | nothing | **not** mounted |
 | `open` | everything: escape hatch, avoid | mounted |
 
 Switching recreates the container and keeps your state and home volume: `vibe up --net local`.
 
-**"The agent can't reach X":** run `vibe logs` to see the blocked host, then `vibe allow X`. Running containers pick it up immediately. To change what *everyone* gets, edit [net/lists/](net/lists/) or an agent's `domains.txt`. To make a new profile, add `net/profiles/<name>.txt`. After editing any list by hand, run `vibe allow` (no arguments) to reload.
+Every allowlist entry is pinned to a port: `example.com` allows HTTPS to `example.com:443` only, `.example.com` adds its subdomains, and `host:8080` allows exactly that port (HTTP or HTTPS). Your host machine itself is never reachable from a bubble, except through the proxy for entries you list.
+
+**"The agent can't reach X":** run `vibe logs` to see the blocked host, then `vibe allow X`. Running containers pick it up immediately. To change what *everyone* gets, edit [net/lists/](net/lists/) or an agent's `domains.txt`. To make a new profile, add `net/profiles/<name>.txt` (only `vibe doctor <project>` on a container using it verifies it). After editing any list by hand, run `vibe up <project>` or `vibe allow` (no arguments) to reload.
 
 ## Local models (sensitive data)
 
-opencode is the **local-model-only** agent. Three walls keep it that way:
-- **Managed config:** `/etc/opencode/opencode.json` in the image (root-owned) enables only one provider, named `local`. opencode's built-in cloud providers are switched off, and neither your config nor a project's `opencode.json` can turn them back on.
+opencode (version 2, npm `@opencode/cli`; both `opencode` and `opencode2` work) is the **local-model-only** agent. Three walls keep it that way:
+- **Managed config:** `/etc/opencode/opencode.json` in the image (root-owned) enables only one provider, named `local`. Neither your config nor a project's `opencode.json` can turn any other provider on.
 - **Start guard:** opencode refuses to start unless the container is on `--net local` (or `offline`), where nothing but your local endpoints is reachable.
-- **No cloud catalog:** it doesn't fetch the cloud model list (models.dev) or update itself.
+- **No phoning home:** no cloud model catalog (models.dev), no free cloud models, no self-update.
 
 Setup:
 
 1. Run a model server on the host that listens on the Docker bridge, e.g. `OLLAMA_HOST=172.17.0.1:11434 ollama serve`. Prefer the bridge IP to `0.0.0.0`, which would expose it to your LAN.
 2. Add `host.docker.internal:11434` to `~/.vibe/local-endpoints.txt`.
-3. Define your model in `~/.vibe/state/opencode/config/opencode.json`. It's seeded on first start; the provider **must** be called `local`:
-   ```json
-   {
-     "provider": {
-       "local": {
-         "npm": "@ai-sdk/openai-compatible",
-         "name": "Local model server",
-         "options": { "baseURL": "http://host.docker.internal:11434/v1" },
-         "models": { "qwen3-coder:30b": {} }
-       }
-     },
-     "model": "local/qwen3-coder:30b"
-   }
+3. Define your model in `~/.vibe/state/opencode/config/opencode.jsonc`. It's seeded on first `--net local` start from [agents/opencode/opencode.example.jsonc](agents/opencode/opencode.example.jsonc), which also contains a sensible permission policy. The provider **must** stay named `local`:
+   ```jsonc
+   "providers": {
+     "local": {
+       "package": "aisdk:@ai-sdk/openai-compatible",
+       "settings": { "baseURL": "http://host.docker.internal:11434/v1", "apiKey": "not-needed" },
+       "models": { "qwen3-coder:30b": { "limit": { "context": 131072, "output": 32768 } } }
+     }
+   },
+   "model": "local/qwen3-coder:30b"
    ```
-   Any OpenAI-compatible server works (Ollama, LM Studio, llama.cpp, vLLM); change `baseURL` and the model names.
+   Any OpenAI-compatible server works (Ollama, LM Studio, llama.cpp, vLLM): change `baseURL`, `apiKey` and the model names, and list the same `host:port` in step 2.
 4. `vibe up <project> --net local`, then `vibe shell <project> -- opencode`.
 
-Under `local`, Claude/Codex credentials aren't mounted and cloud APIs are refused. `vibe doctor <project>` tells you whether your endpoint answers. opencode needs no internet even on first use; this was tested against an offline mock server.
+Under `local`, Claude/Codex credentials aren't mounted and cloud APIs are refused. `vibe doctor <project>` tells you whether your endpoint answers. opencode needs no internet, not even on first use (tested through the proxy against a mock model server).
 
 ## VS Code
 
@@ -190,4 +195,6 @@ Set `VIBE_BASE_IMAGE` in `vibe.conf` (shared) or `~/.vibe/config` (just you) to 
 - **Agent hits 403 / "CONNECT tunnel failed":** the host isn't allowlisted. Run `vibe logs`, then `vibe allow <host>`.
 - **`vibe audit` warns after a session:** the agent changed something your host could execute (`.vscode/`, `.envrc`, …). Review it, then run `vibe audit --accept`.
 - **Permission errors on project files:** the image is built with your UID/GID. If you build for someone else, they must run their own `vibe build`.
+- **"`.git/config` contains credentials":** your repo's remote URL has a token in it (`https://user:TOKEN@…`). The agent could read it and push with it, so vibe refuses. Run `git remote set-url origin https://github.com/OWNER/REPO.git` and keep the token in a credential helper on your host.
+- **"…predates host isolation":** that project's network was created by an older vibe. Run `vibe down <project> && vibe up <project>`.
 - **Agent can't commit:** set your identity in `~/.vibe/state/git/identity` (`vibe setup` seeds it from your host git config, if present).

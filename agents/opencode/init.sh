@@ -4,4 +4,6 @@ set -eu
 dir=/home/user/.config/opencode
 mountpoint -q "$dir" 2>/dev/null || exit 0
 [ -e "$dir/AGENTS.md" ] || [ -L "$dir/AGENTS.md" ] || ln -s /opt/vibe/AGENTS.md "$dir/AGENTS.md"
-[ -e "$dir/opencode.json" ] || cp /opt/vibe/agents/opencode/opencode.example.json "$dir/opencode.json"
+if [ ! -e "$dir/opencode.json" ] && [ ! -e "$dir/opencode.jsonc" ]; then
+  cp /opt/vibe/agents/opencode/opencode.example.jsonc "$dir/opencode.jsonc"
+fi

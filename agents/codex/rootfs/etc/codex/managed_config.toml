@@ -1,0 +1,3 @@
+# Managed Codex config for the bubble (root-owned; takes precedence over ~/.codex/config.toml).
+[analytics]
+enabled = false

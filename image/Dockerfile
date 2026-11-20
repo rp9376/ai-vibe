@@ -77,3 +77,5 @@ ENV PATH=/home/user/.local/bin:$PATH \
 USER user
 WORKDIR /workspaces
 CMD ["/opt/vibe/bin/vibe-init"]
+# Format this image speaks (see VIBE_FORMAT in vibe). Last, so bumping it keeps the build cache.
+LABEL vibe.format="2"

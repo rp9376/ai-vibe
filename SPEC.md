@@ -11,7 +11,7 @@
 - **One image, every agent.** Claude Code (primary), Codex, and opencode (local models) live in one image. An agent is a folder in `agents/`: add or remove the folder, rebuild.
 - **One CLI.** `vibe up | shell | code | down | doctor | allow | audit`. Works on any folder, with or without a git remote, and never writes into the project.
 - **The container is the boundary.** Non-root, zero capabilities, no-new-privileges, Docker's default seccomp + AppArmor, resource limits. Inside it, agents may run fully autonomous ("vibe mode").
-- **Egress is allowlisted.** The container sits on an internal Docker network; the only way out is a per-project allowlist proxy. Profiles: `agents` (default), `local` (local model only, no cloud credentials), `offline`, `open` (escape hatch).
+- **Egress is allowlisted.** The container sits on an internal, isolated Docker network (no route out, and the host has no address on it); the only way out is a per-project proxy whose allowlist is pinned to `host:port`. Profiles: `agents` (default), `local` (local model only, no cloud credentials), `offline`, `open` (escape hatch).
 - **Bubble state is not host state.** Agents keep their own state under `~/.vibe/state/`; the host's `~/.claude` / `~/.codex` are never mounted.
 - **The workspace is guarded in both directions.** `.git/config` and `.git/hooks` are read-only inside; `vibe audit` flags changes to files the host might execute.
 - **Verifiable.** `vibe doctor` proves the image and network boundary; `vibe doctor <dir>` proves a live container after attach.
@@ -116,9 +116,11 @@ Adding an agent = new folder + `vibe build`. Removing = delete the folder or set
 
 **AGT-3** MUST — **Codex CLI** supported: state at `~/.vibe/state/codex` mounted as `~/.codex`; sign-in works from inside a container (device code or API key).
 
-**AGT-4** MUST — **Local-only harness (opencode)** for sensitive data: `AGENT_CLOUD=no`. It is local-only by enforcement, not convention: (a) a root-owned managed config (`/etc/opencode/opencode.json`) enables only the provider named `local`, which user and project configs cannot widen (E-4); (b) a start guard refuses to run outside the `local`/`offline` profiles; (c) the cloud model catalog fetch and self-update are disabled. The endpoint and models of `local` are per-developer config in its state directory (never baked into the image). Under `local` it can reach only the declared local endpoints, and no cloud agent state is mounted. Documented as the recommended path for sensitive data.
+**AGT-4** MUST — **Local-only harness (opencode V2, npm `@opencode/cli`)** for sensitive data: `AGENT_CLOUD=no`. It is local-only by enforcement, not convention: (a) a root-owned managed config (`/etc/opencode/opencode.json`) enables only the provider named `local`, which user and project configs cannot widen (E-4); (b) a start guard refuses to run outside the `local`/`offline` profiles; (c) the cloud model catalog fetch and self-update are disabled. The endpoint and models of `local` are per-developer config in its state directory (never baked into the image). Under `local` it can reach only the declared local endpoints, and no cloud agent state is mounted. Documented as the recommended path for sensitive data.
 
 **AGT-5** MUST — **Instructions.** One shared [image/AGENTS.md](image/AGENTS.md), installed at `/opt/vibe/AGENTS.md`, tells agents about the bubble. Each agent loads it through its *global* instruction mechanism — Claude: the build copies `AGENTS.md` to `/etc/claude-code/CLAUDE.md` (its managed instructions; D-8); Codex/opencode: a symlink in their global config directory, created by `init.sh`. Projects are never modified; a project's own `AGENTS.md`/`CLAUDE.md` still applies on top.
+
+**AGT-7** MUST — Each `agent.conf` names its version: `latest` (the default, D-13) or an exact pin; the last verified pin stays in the file as a comment so re-pinning is one line. Each agent's non-essential traffic (telemetry, error reporting, self-update, cloud catalogs) is switched off where the pinned version supports it, preferably through root-owned managed config the agent cannot override. The switches are verified against the installed version and recorded in §14; re-verify after a `vibe build --fresh` brings new versions.
 
 **AGT-6** SHOULD — Each agent offers a vibe-mode alias (no per-command approvals), e.g. `claude-vibe`, `codex-vibe`. Approval-free mode is acceptable *here* because RUN, NET and WS hold regardless of the agent's own settings.
 
@@ -136,22 +138,22 @@ Adding an agent = new folder + `vibe build`. Removing = delete the folder or set
 
 ## 7. Network (NET)
 
-**NET-1** MUST — A container on a filtered profile attaches only to a per-project `--internal` Docker network (no route to host, LAN or internet). Its only egress is a per-project proxy container that sits on that network (alias `vibe-proxy`) and on the default bridge.
+**NET-1** MUST — A container on a filtered profile attaches only to a per-project Docker network that is `--internal` (no route to LAN or internet) **and isolated** (`gateway_mode_ipv4=isolated`, or `inhibit_ipv4` on older Docker): the host has no address on it, so host services are unreachable even when they listen on all interfaces (E-8). Its only egress is a per-project proxy container that sits on that network (alias `vibe-proxy`) and on the default bridge.
 
-**NET-2** MUST — The proxy enforces a hostname allowlist, default deny, for HTTPS `CONNECT` (port 443 only) and plain HTTP. It runs hardened: non-root, caps dropped, read-only root, limits.
+**NET-2** MUST — The proxy enforces an allowlist, default deny, **pinned to `host:port`**: an entry `host` allows HTTPS to `host:443` only, `.host` adds subdomains, `host:port` allows exactly that port for HTTPS (`CONNECT`) or plain HTTP (D-11). It runs hardened: non-root, caps dropped, read-only root, limits.
 
 **NET-3** MUST — Profiles, chosen per container at `up` time; each filtered profile is a file in `net/profiles/` listing which domain lists it allows (custom profiles may be added):
 
 | Profile | Allows | Cloud agent state |
 |---|---|---|
 | `agents` *(default)* | `agents/*/domains.txt` + `net/lists/vscode.txt` + `net/lists/registries.txt` + personal `~/.vibe/allow.txt` | mounted |
-| `local` | only `~/.vibe/local-endpoints.txt` | **not** mounted |
+| `local` | only the `host:port` entries in `~/.vibe/local-endpoints.txt` | **not** mounted |
 | `offline` | nothing (`--network none`) | **not** mounted |
 | `open` | everything (plain bridge) — escape hatch, loud warning, never default | mounted |
 
 **NET-4** MUST — Proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, lower-case variants, `NO_PROXY=localhost,127.0.0.1,::1`) are set in the container. Tools that ignore them fail closed (no route), never open.
 
-**NET-5** MUST — `vibe allow <domain>` adds a personal entry and reloads running proxies without restarting dev containers; `vibe logs` shows what was blocked. "The agent can't reach X" is fixed with one command.
+**NET-5** MUST — `vibe allow <domain>` adds a personal entry and reloads running proxies without restarting dev containers; `vibe up` on a running project reloads its proxy when the generated allowlist changed; `vibe logs` shows what was blocked. "The agent can't reach X" is fixed with one command.
 
 **NET-6** MUST — Host services are reachable only when explicitly allowlisted (e.g. `host.docker.internal` for a local model server, in `local-endpoints.txt`).
 
@@ -177,6 +179,8 @@ Adding an agent = new folder + `vibe build`. Removing = delete the folder or set
 
 **WS-2** MUST — `vibe audit` compares host-trust paths (default: `.devcontainer/`, `.devcontainer.json`, `.vscode/`, `.envrc`, `.git/config`, `.git/hooks/`, `.gitattributes`, `.gitmodules`, `mise.toml`, `.mise.toml`, `.tool-versions`; configurable) with a baseline taken at the project's first `up`. `--accept` updates the baseline. `vibe down` runs the audit automatically.
 
+**WS-4** MUST — `vibe up` refuses to create a container when the project's `.git/config` contains credentials (userinfo in a remote URL, a token-shaped user, an `extraheader` authorization, a `password`): the agent could read them through the read-only mount and push with them. The warning shows the lines redacted. The live doctor checks the same.
+
 **WS-3** — Documented rule: after a vibe session, treat the workspace as untrusted input for anything the *host* executes (build scripts, `package.json` scripts, Makefiles). Open it on the host only after `vibe audit` is clean or reviewed.
 
 ## 10. Editor integration (EDT)
@@ -193,25 +197,25 @@ Adding an agent = new folder + `vibe build`. Removing = delete the folder or set
 
 **CRED-1** MUST — No host SSH, GPG, git-credential, Docker or cloud credential material enters the container, defended in at least two independent layers: (a) vibe owns container creation, so no credential mounts or sockets exist at creation; (b) host editor settings (EDT-3); (c) `remoteEnv` blanking (EDT-2); (d) post-attach scrub (EDT-4); (e) no ssh/gpg agent tooling in the image (IMG-3).
 
-**CRED-2** MUST — Live checks confirm the absence of: bridge sockets, `SSH_AUTH_SOCK`/`GPG_AGENT_INFO`, credential helpers in effective git config, keys in `~/.ssh`.
+**CRED-2** MUST — Live checks confirm the absence of: bridge sockets; any visible process (VS Code's server included, not just the doctor's own shell) whose `SSH_AUTH_SOCK`/`GPG_AGENT_INFO`/`REMOTE_CONTAINERS_IPC` points at an existing socket; credential helpers in effective git config; keys in `~/.ssh`.
 
 ## 12. Verification (VER)
 
 **VER-1** MUST — `vibe doctor` (no argument) verifies the image with `--pull=never`, no host mounts, and the test script piped in via stdin (never baked in or mounted). Phase 1 runs with `--network none`; phase 2 on a throwaway internal network + proxy using the `agents` profile.
 
-**VER-2** MUST — Assertions: non-root UID; `CapEff` and `CapBnd` zero; `NoNewPrivs: 1`; seccomp filtering active; no sudo; workspace writable; system directories and agent policy not writable; no Docker socket; each enabled agent's `AGENT_CHECK` succeeds. Offline: no egress. Filtered: no default route, direct egress fails, external DNS does not resolve, an unlisted domain is refused by the proxy, an allowlisted domain is reachable (warning only — needs internet).
+**VER-2** MUST — Assertions: non-root UID; `CapEff` and `CapBnd` zero; `NoNewPrivs: 1`; seccomp filtering active; no sudo; workspace writable; system directories and agent policy not writable; no Docker socket; each enabled agent's `AGENT_CHECK` succeeds. Offline: no egress. Filtered: no default route, direct egress fails, external DNS does not resolve, a reserved unlisted name (`blocked.vibe-doctor.invalid`) is refused by the proxy, **a throwaway test service listening on all host interfaces is not reachable directly**, an allowlisted host is reachable (a proxy 403 there is a FAIL; no answer is a warning, since it needs internet).
 
-**VER-3** MUST — `vibe doctor <dir>` runs the same assertions in the live project container, plus: host-backed mounts are exactly RUN-4's set, `.git/config` and `.git/hooks` are read-only, cloud state is absent under `local`/`offline`, and CRED-2. Run after every (re)attach, before starting agents in VS Code.
+**VER-3** MUST — `vibe doctor <dir>` runs the same assertions in the live project container, plus: every mount, of any filesystem type, is in RUN-4's set (or Docker's standard `/proc`, `/sys`, `/dev` tree), `.git/config` and `.git/hooks` are read-only, cloud state is absent under `local`/`offline`, and CRED-2. Run after every (re)attach, before starting agents in VS Code.
 
 **VER-4** MUST — Non-zero exit status on any failure; output names every check.
 
 **VER-5** MUST — Re-run after any change to: Docker/runc, kernel or AppArmor policy, base image, agent versions, network lists or proxy, or the runtime flags in `vibe`. New environments are recorded in §14.
 
-## 13. Inner sandboxes (SBX) — optional, phase 2
+## 13. Inner sandboxes (SBX) — not planned
 
 **SBX-1** SHOULD — Agents' own sandboxes (Codex's Linux sandbox, Claude Code's sandbox) are defence in depth, not the boundary. The default configuration relies on RUN, NET and WS.
 
-**SBX-2** SHOULD — When enabled: a custom seccomp profile that is a minimal, pinned diff over Docker's default (provenance: source URL, commit, checksum; only the syscalls nested user/mount namespaces need, matched by argument where possible), plus a custom AppArmor profile on hosts that restrict unprivileged user namespaces. No capabilities added. Enabled by config; verified by an extra doctor phase.
+**SBX-2** — **Not planned** (too much host-specific upkeep for a sandbox inside the sandbox; a stronger outer runtime, RUN-5, is the better upgrade). Would require: a custom seccomp profile that is a minimal, pinned diff over Docker's default (provenance: source URL, commit, checksum; only the syscalls nested user/mount namespaces need, matched by argument where possible), plus a custom AppArmor profile on hosts that restrict unprivileged user namespaces. No capabilities added.
 
 **SBX-3** — Known blocker: see §14 entry E-1.
 
@@ -233,6 +237,14 @@ Adding an agent = new folder + `vibe build`. Removing = delete the folder or set
 | E-4 | 2026-11-19 | opencode 1.19.6 reads a managed config from `/etc/opencode/opencode.json` after user and project configs; with `enabled_providers: ["local"]` there, `opencode models` lists only `local/…` even when user and project configs enable `anthropic`/`openai` and API keys are set. Without it, opencode exposes a built-in cloud model list even with the models.dev fetch disabled. |
 | E-5 | 2026-11-19 | opencode's `@ai-sdk/openai-compatible` provider is bundled: a full `opencode run` round-trip against a mock OpenAI-compatible server succeeded with `--network none`. No npm fetch is needed under `local`. |
 | D-9 | 2026-11-19 | opencode is enforced local-only (AGT-4): managed provider allowlist + start guard (wrapper replacing the `opencode` bin) + `OPENCODE_DISABLE_MODELS_FETCH`/`_AUTOUPDATE`/`_CLAUDE_CODE`. The guard is a guardrail; the network profile is the wall. |
+| E-6 | 2026-11-20 | **opencode 2.3.2** (`@opencode/cli`, same publisher as `opencode-ai`, SLSA provenance; npm `opencode2` is a security placeholder, not the real package): the managed `/etc/opencode/opencode.json` `enabled_providers: ["local"]` blocks other providers (control: with it hidden, a provider named `other` answers; with it, "Model unavailable"); the provider package (`aisdk:@ai-sdk/openai-compatible` or `@opencode/ai/providers/openai-compatible`) is bundled, so a full run works with `--network none` and through the `local` proxy with npm blocked (V1's runtime `@opencode-ai/plugin` install does not occur). `opencode run` reads stdin when it isn't a terminal: scripts must pass `< /dev/null`. |
+| E-7 | 2026-11-20 | Non-essential-traffic switches present in the pinned versions: Claude Code 2.1.328 has `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`, `DISABLE_BUG_COMMAND` (not `DISABLE_NON_ESSENTIAL_MODEL_CALLS` or `DISABLE_STATSIG`); Codex 0.170.0 reads `/etc/codex/managed_config.toml` and has `[analytics] enabled = false`; opencode 2.3.2 has `OPENCODE_DISABLE_MODELS_FETCH`, `_FREE_MODELS`, `_AUTOUPDATE`, `_CLAUDE_CODE`. |
+| E-8 | 2026-11-20 | **Found by external review, confirmed:** on a plain `--internal` network the host owns the gateway address, so a container reached a host service bound to `0.0.0.0` directly, bypassing the proxy (the doctor only tested the host *through* the proxy). Fixed by isolated networks (NET-1); the doctor now runs a real test service on the host and must fail to reach it (verified to FAIL on an old-style network). |
+| D-10 | 2026-11-20 | Isolation via Docker's network option instead of host `iptables` rules: no `sudo`, nothing to persist or clean up on the host. |
+| D-11 | 2026-11-20 | Port pinning via tinyproxy `FilterURLs On` (rules see `host:port` for CONNECT and `http://host:port/…` for HTTP); `ConnectPort` is no longer needed. |
+| D-12 | 2026-11-20 | The opencode seed config keeps the owner's permission policy but **allows** `git add`/`git commit` (bubble instructions ask agents to commit often; push is impossible from inside anyway). |
+| D-13 | 2026-11-20 | Owner's choice: agents track `latest` instead of exact pins (pins kept as comments). Trade-off accepted: builds on different days can differ, and a renamed switch would silently stop working. Mitigation: re-check switches after `--fresh` builds. Same day, the switches were confirmed present in Claude Code 2.1.329 and Codex 0.171.0. |
+| V-2 | 2026-11-20 | Re-verified on E-1's host with the review fixes: `vibe doctor` passes both phases; live doctor passes under `agents` and `local`; `local` round-trip with opencode 2.3.2 through the proxy against a mock model on the host; port pinning (listed port 200, next port 403, cloud API 403); `.git/config` with a token is refused; shellcheck clean. |
 | V-1 | 2026-11-19 | **Verified on E-1's host.** Images: `ubuntu:22.04` + Node 24.22.3, Claude Code 2.1.328, Codex 0.170.0, opencode 1.19.6; proxy `alpine:3.22` + tinyproxy 1.11.2. `vibe doctor` passes (34 checks). Acceptance: **1, 2, 3, 4, 9, 10, 11 pass**; 3 includes `up → doctor → down` leaving the tree identical (names, sizes, mtimes, modes). **Not yet verified:** 5 (VS Code attach; Dev Containers extension not installed on this host), 6–7 (agent sign-in round-trips), 8 (local-model round-trip; no model server running; proxy forwarding to the endpoint verified), 12 (docs reviewed by a second person). |
 
 ## 15. Non-goals

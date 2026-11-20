@@ -20,6 +20,22 @@ refute()  { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pas
 st()      { awk -v k="$1:" '$1 == k { print $2 }' /proc/self/status; }
 default_route() { awk 'NR > 1 && $2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route; }
 any()     { compgen -G "$1" >/dev/null; }
+only_loopback() { local i; for i in /sys/class/net/*; do [ "${i##*/}" = lo ] || return 1; done; }
+subnet_gateway() {   # first non-default route → its network address + 1 (Docker's gateway convention)
+  local h
+  h=$(awk 'NR > 1 && $2 != "00000000" { print $2; exit }' /proc/net/route)
+  [ -n "$h" ] && printf '%d.%d.%d.%d' "0x${h:6:2}" "0x${h:4:2}" "0x${h:2:2}" "$((0x${h:0:2} + 1))"
+}
+bridge_in_env() {   # succeeds if any visible process has a host-bridge variable pointing at an existing socket
+  local f v
+  for f in /proc/[0-9]*/environ; do
+    for v in $(tr '\0' '\n' < "$f" 2>/dev/null | sed -n -E 's/^(SSH_AUTH_SOCK|GPG_AGENT_INFO|REMOTE_CONTAINERS_IPC)=(.+)$/\2/p'); do
+      [ -S "${v%%:*}" ] && return 0
+    done
+  done
+  return 1
+}
+GIT_SECRET_RE='https?://[^/@[:space:]]*:[^/@[:space:]]+@|https?://(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-)[^/@[:space:]]*@|extraheader[[:space:]]*=.*(authorization|bearer|basic)|^[[:space:]]*password[[:space:]]*='
 
 privileges() {
   section "privileges (RUN-1)"
@@ -59,8 +75,9 @@ filesystem() {
 
 credentials() {
   section "credentials (CRED-1, CRED-2)"
-  check  "SSH_AUTH_SOCK unset" test -z "${SSH_AUTH_SOCK:-}"
-  check  "GPG_AGENT_INFO unset" test -z "${GPG_AGENT_INFO:-}"
+  # Every process we can see (VS Code's server included, not just this shell): does any of them point
+  # at a host bridge socket that still exists?
+  refute "no process references a live SSH/GPG/Dev Containers bridge socket" bridge_in_env
   refute "no VS Code SSH-agent bridge sockets" any '/tmp/vscode-ssh-auth-*'
   refute "no Dev Containers IPC bridge sockets" any '/tmp/vscode-remote-containers-ipc-*'
   refute "no GPG agent sockets" any "$HOME/.gnupg/S.gpg-agent*"
@@ -86,7 +103,7 @@ network() {
   section "network: $NET (NET-1..NET-6)"
   case $NET in
     offline)
-      check  "only loopback interface" test "$(ls /sys/class/net | grep -vx lo | wc -l)" -eq 0
+      check  "only loopback interface" only_loopback
       refute "outbound HTTPS fails" curl -sS -m 5 -o /dev/null https://example.com
       ;;
     open)
@@ -97,17 +114,25 @@ network() {
       refute "direct egress fails (bypassing the proxy)" curl -sS -m 5 --noproxy '*' -o /dev/null https://1.1.1.1
       refute "external DNS does not resolve" getent hosts example.com
       check  "proxy reachable (vibe-proxy)" getent hosts vibe-proxy
-      local code
-      code=$(curl -sS -m 10 -o /dev/null -w '%{http_connect}' https://example.com 2>/dev/null || true)
-      if [ "$code" = 403 ]; then pass "proxy refuses an unlisted host (example.com → 403)"
-      else fail "proxy refuses an unlisted host (example.com → ${code:-no answer}, expected 403)"; fi
+      local code gw blocked=blocked.vibe-doctor.invalid   # reserved name: can never be allowlisted by accident
+      code=$(curl -sS -m 10 -o /dev/null -w '%{http_connect}' "https://$blocked/" 2>/dev/null || true)
+      if [ "$code" = 403 ]; then pass "proxy refuses an unlisted host ($blocked → 403)"
+      else fail "proxy refuses an unlisted host ($blocked → ${code:-no answer}, expected 403)"; fi
       if [ "$NET" != local ]; then
         refute "host machine not reachable via proxy (host.docker.internal)" curl -fsS -m 5 -o /dev/null http://host.docker.internal/
+      fi
+      # NET-1: a real service on the host (started by vibe doctor) must not be reachable directly.
+      gw=$(subnet_gateway)
+      if [ -n "${VIBE_DOCTOR_HOSTPORT:-}" ] && [ -n "$gw" ]; then
+        refute "host services not reachable directly (test service on host :$VIBE_DOCTOR_HOSTPORT via $gw)" \
+          curl -sS -m 3 --noproxy '*' -o /dev/null "http://$gw:$VIBE_DOCTOR_HOSTPORT/"
+      else
+        warn "direct host-reachability test skipped (no host test service)"
       fi
       local a=${VIBE_DOCTOR_ALLOWED:-} out
       if [ -z "$a" ]; then
         warn "allowlist is empty for '$NET' (nothing is reachable)"
-      elif [ "$NET" = local ]; then   # local model endpoints are plain HTTP, often on a custom port
+      elif [ "$NET" = local ] && [ "${a#*:}" != "$a" ]; then   # host:port endpoint: plain HTTP, custom port
         code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "http://$a/" 2>/dev/null || true)
         case $code in
           403) fail "proxy refuses the local endpoint $a (check ~/.vibe/local-endpoints.txt)" ;;
@@ -116,8 +141,11 @@ network() {
         esac
       else
         out=$(curl -sS -m 15 -o /dev/null -w '%{http_connect}' "https://${a%%:*}/" 2>/dev/null || true)
-        if [ "$out" = 200 ]; then pass "allowlisted host reachable through the proxy (${a%%:*})"
-        else warn "allowlisted host not reachable (${a%%:*}, CONNECT ${out:-no answer}) — no internet on the host?"; fi
+        case $out in
+          200) pass "allowlisted host reachable through the proxy (${a%%:*})" ;;
+          403) fail "proxy refuses an ALLOWLISTED host (${a%%:*} → 403): the generated allowlist is broken" ;;
+          *)   warn "allowlisted host not reachable (${a%%:*}, CONNECT ${out:-no answer}) — no internet on the host?" ;;
+        esac
       fi
       ;;
   esac
@@ -132,13 +160,13 @@ mounts() {
   for d in /opt/vibe/agents/*/; do
     for m in $( (set +u; . "$d/agent.conf"; printf '%s' "${AGENT_STATE:-}") ); do expected="$expected ${m#*:}"; done
   done
-  # Host-backed = not a kernel/virtual filesystem. mountinfo escapes spaces as \040.
-  unexpected=$(awk '{ split($0, a, " - "); split(a[2], b, " "); print b[1], $5 }' /proc/self/mountinfo |
-    awk '$1 !~ /^(proc|sysfs|tmpfs|devpts|mqueue|cgroup2?|overlay|securityfs|debugfs|tracefs|fusectl|configfs|pstore|bpf|hugetlbfs|devtmpfs|autofs|binfmt_misc|nsfs|shm|ramfs)$/ { print $2 }' |
-    sed 's/\\040/ /g' | while IFS= read -r m; do
+  # Every mountpoint of ANY filesystem type (a bind of the host's /run/user/… is tmpfs, too) must be
+  # either Docker's standard /, /proc, /sys, /dev tree or in the expected set. mountinfo escapes spaces as \040.
+  unexpected=$(awk '{ print $5 }' /proc/self/mountinfo | sed 's/\\040/ /g' | while IFS= read -r m; do
+      case $m in /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*) continue ;; esac
       case " $expected " in *" $m "*) ;; *) printf '%s ' "$m" ;; esac
     done)
-  if [ -z "$unexpected" ]; then pass "host-backed mounts are only the expected set"; else fail "unexpected host-backed mounts: $unexpected"; fi
+  if [ -z "$unexpected" ]; then pass "mounts are only the expected set"; else fail "unexpected mounts: $unexpected"; fi
 
   if [ "${VIBE_CLOUD_STATE:-yes}" = no ]; then
     for d in /opt/vibe/agents/*/; do
@@ -157,6 +185,7 @@ workspace() {
   if [ -d "$WS/.git" ]; then
     refute ".git/config read-only" test -w "$WS/.git/config"
     refute ".git/hooks read-only" test -w "$WS/.git/hooks"
+    refute "no credentials in .git/config" grep -qiE "$GIT_SECRET_RE" "$WS/.git/config"
   else
     warn "no .git directory in the workspace — nothing to protect yet"
   fi
